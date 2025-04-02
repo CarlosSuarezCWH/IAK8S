@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  labels:
+    app: document-ai
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: document-ai
+  template:
+    metadata:
+      labels:
+        app: document-ai
+    spec:
+      initContainers:
+        - name: init-db
+          image: busybox
+          command: ['sh', '-c', 'until nc -z db 3306; do echo "Waiting for MySQL"; sleep 2; done']
+      containers:
+      - name: app
+        image: your-registry/document-ai:${TAG}
+        ports:
+        - containerPort: 8000
+        envFrom:
+        - configMapRef:
+            name: app-config
+        - secretRef:
+            name: app-secrets
+        volumeMounts:
+        - name: uploads
+          mountPath: /app/uploads
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: uploads
+        persistentVolumeClaim:
+          claimName: uploads-pvc
