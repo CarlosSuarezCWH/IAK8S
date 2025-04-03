@@ -1,0 +1,83 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration
+  namespace: {{ .Values.namespace | default "document-ai" }}
+  labels:
+    app.kubernetes.io/name: document-ai
+    app.kubernetes.io/component: migration
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount | default "migrator" }}
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-db
+          image: bitnami/kubectl:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until kubectl exec -n {{ .Values.namespace }} {{ .Release.Name }}-db-0 -- \
+                mysqladmin ping -u${DB_USER} -p${DB_PASSWORD} --silent; do
+                echo "Waiting for MySQL to be ready...";
+                sleep 5;
+              done
+              echo "MySQL is ready!"
+          env:
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-db-secrets
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-db-secrets
+                  key: password
+
+        - name: wait-for-mongo
+          image: bitnami/kubectl:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until kubectl exec -n {{ .Values.namespace }} {{ .Release.Name }}-mongo-0 -- \
+                mongosh --eval "db.adminCommand('ping')"; do
+                echo "Waiting for MongoDB to be ready...";
+                sleep 5;
+              done
+              echo "MongoDB is ready!"
+
+      containers:
+        - name: migrator
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag | default "latest" }}
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          command: ["sh", "-c", "alembic upgrade head"]
+          envFrom:
+            - configMapRef:
+                name: {{ .Release.Name }}-app-config
+            - secretRef:
+                name: {{ .Release.Name }}-app-secrets
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/alembic.ini
+              subPath: alembic.ini
+              readOnly: true
+
+      volumes:
+        - name: config-volume
+          configMap:
+            name: {{ .Release.Name }}-alembic-config
+            items:
+              - key: alembic.ini
+                path: alembic.ini

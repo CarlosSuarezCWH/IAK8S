@@ -1,172 +1,165 @@
 import os
+import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional, List, AsyncGenerator
+from pathlib import Path
 
 from fastapi import UploadFile, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
 
 from app.config import settings
-from app.models.document import Document
-from app.models.user import User
-from app.database.mysql import SessionLocal
+from app.database import get_db_session
+from app.models.document import Document, SharedDocument
+from app.schemas.document import DocumentCreate, DocumentShare
 from app.utils.file_processing import save_upload_file, extract_text_from_file
 from app.services.vector_store import VectorStoreService
-from app.schemas.document import DocumentCreate, DocumentShare
+from app.services.ollama import OllamaService
+
+logger = logging.getLogger(__name__)
 
 class DocumentService:
     @staticmethod
-    def create_document(user: User, file: UploadFile, doc_data: DocumentCreate):
-        db = SessionLocal()
-        
+    async def create_document(
+        db: AsyncSession,
+        user_id: int,
+        file: UploadFile,
+        doc_data: DocumentCreate
+    ) -> Document:
+        # Validate file size
+        if file.size > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"File size exceeds {settings.MAX_FILE_SIZE_MB}MB limit"
+            )
+
         # Save file to disk
-        file_path = save_upload_file(settings.UPLOAD_FOLDER, file)
+        file_path = await save_upload_file(settings.UPLOAD_FOLDER, file)
         
         # Create document record
         document = Document(
-            user_id=user.id,
+            user_id=user_id,
             name=doc_data.name or file.filename,
             file_path=file_path,
             file_type=file.content_type,
-            file_size=os.path.getsize(file_path),
+            file_size=file.size,
             tags=",".join(doc_data.tags) if doc_data.tags else None
         )
         
         db.add(document)
-        db.commit()
-        db.refresh(document)
-        db.close()
-        
+        await db.commit()
+        await db.refresh(document)
         return document
 
     @staticmethod
-    def get_user_documents(user_id: int, skip: int = 0, limit: int = 100):
-        db = SessionLocal()
-        documents = db.query(Document).filter(Document.user_id == user_id).offset(skip).limit(limit).all()
-        db.close()
-        return documents
+    async def get_user_documents(
+        db: AsyncSession,
+        user_id: int,
+        skip: int = 0,
+        limit: int = 100
+    ) -> List[Document]:
+        result = await db.execute(
+            select(Document)
+            .where(Document.user_id == user_id)
+            .offset(skip)
+            .limit(limit)
+        )
+        return result.scalars().all()
 
     @staticmethod
-    def get_document_by_id(document_id: int, user_id: int):
-        db = SessionLocal()
-        document = db.query(Document).filter(
-            Document.id == document_id,
-            Document.user_id == user_id
-        ).first()
-        db.close()
-        
-        if not document:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Document not found"
+    async def process_document(
+        db: AsyncSession,
+        document_id: int,
+        user_id: int
+    ) -> Document:
+        # Get document with lock
+        result = await db.execute(
+            select(Document)
+            .where(
+                Document.id == document_id,
+                Document.user_id == user_id
             )
-        return document
-
-    @staticmethod
-    def delete_document(document_id: int, user_id: int):
-        db = SessionLocal()
-        document = db.query(Document).filter(
-            Document.id == document_id,
-            Document.user_id == user_id
-        ).first()
+            .with_for_update()
+        )
+        document = result.scalars().first()
         
         if not document:
-            db.close()
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Document not found"
-            )
-        
-        # Delete file from disk
-        try:
-            os.remove(document.file_path)
-        except OSError:
-            pass
-        
-        # Delete from database
-        db.delete(document)
-        db.commit()
-        db.close()
-        return {"message": "Document deleted successfully"}
-
-    @staticmethod
-    def process_document(document_id: int, user_id: int):
-        db = SessionLocal()
-        document = db.query(Document).filter(
-            Document.id == document_id,
-            Document.user_id == user_id
-        ).first()
-        
-        if not document:
-            db.close()
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Document not found"
             )
         
         if document.processed:
-            db.close()
-            return {"message": "Document already processed"}
+            return document
         
-        # Extract text from file
-        text = extract_text_from_file(document.file_path)
-        
-        # Process text and create embeddings
-        vector_service = VectorStoreService()
-        vector_service.create_and_store_embeddings(
-            document_id=str(document.id),
-            text=text,
-            metadata={
-                "user_id": str(user_id),
-                "document_name": document.name,
-                "document_type": document.file_type
-            }
-        )
-        
-        # Update document status
-        document.processed = True
-        db.commit()
-        db.refresh(document)
-        db.close()
-        
-        return {"message": "Document processed successfully"}
+        try:
+            # Extract text from file
+            text = await extract_text_from_file(document.file_path)
+            
+            # Process text and create embeddings
+            vector_service = VectorStoreService()
+            await vector_service.create_and_store_embeddings(
+                document_id=str(document.id),
+                text=text,
+                metadata={
+                    "user_id": str(user_id),
+                    "document_name": document.name,
+                    "document_type": document.file_type
+                }
+            )
+            
+            # Update document status
+            await db.execute(
+                update(Document)
+                .where(Document.id == document_id)
+                .values(processed=True, updated_at=datetime.utcnow())
+            )
+            await db.commit()
+            
+            # Refresh document
+            await db.refresh(document)
+            return document
+            
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error processing document {document_id}: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Error processing document"
+            )
 
     @staticmethod
-    def share_document(document_id: int, owner_id: int, share_data: DocumentShare):
-        db = SessionLocal()
-        
-        # Get document
-        document = db.query(Document).filter(
-            Document.id == document_id,
-            Document.user_id == owner_id
-        ).first()
-        
-        if not document:
-            db.close()
+    async def share_document(
+        db: AsyncSession,
+        document_id: int,
+        owner_id: int,
+        share_data: DocumentShare
+    ) -> SharedDocument:
+        # Check if document exists and belongs to owner
+        doc_result = await db.execute(
+            select(Document)
+            .where(
+                Document.id == document_id,
+                Document.user_id == owner_id
+            )
+        )
+        if not doc_result.scalars().first():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Document not found"
             )
         
         # Get user to share with
-        shared_with = db.query(User).filter(User.email == share_data.email).first()
+        user_result = await db.execute(
+            select(User)
+            .where(User.email == share_data.email)
+        )
+        shared_with = user_result.scalars().first()
+        
         if not shared_with:
-            db.close()
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="User with this email not found"
-            )
-        
-        # Check if already shared
-        existing_share = db.query(SharedDocument).filter(
-            SharedDocument.document_id == document_id,
-            SharedDocument.shared_with_id == shared_with.id
-        ).first()
-        
-        if existing_share:
-            db.close()
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Document already shared with this user"
+                detail="User not found"
             )
         
         # Create share record
@@ -178,46 +171,6 @@ class DocumentService:
         )
         
         db.add(shared_doc)
-        db.commit()
-        db.refresh(shared_doc)
-        db.close()
-        
-        return {"message": "Document shared successfully"}
-
-    @staticmethod
-    def get_shared_documents(user_id: int):
-        db = SessionLocal()
-        
-        # Documents shared with me
-        shared_docs = db.query(Document).join(
-            SharedDocument,
-            SharedDocument.document_id == Document.id
-        ).filter(
-            SharedDocument.shared_with_id == user_id
-        ).all()
-        
-        db.close()
-        return shared_docs
-
-    @staticmethod
-    def remove_share(document_id: int, owner_id: int, user_id: int):
-        db = SessionLocal()
-        
-        shared_doc = db.query(SharedDocument).filter(
-            SharedDocument.document_id == document_id,
-            SharedDocument.owner_id == owner_id,
-            SharedDocument.shared_with_id == user_id
-        ).first()
-        
-        if not shared_doc:
-            db.close()
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Share record not found"
-            )
-        
-        db.delete(shared_doc)
-        db.commit()
-        db.close()
-        
-        return {"message": "Share removed successfully"}
+        await db.commit()
+        await db.refresh(shared_doc)
+        return shared_doc

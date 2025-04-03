@@ -1,85 +1,169 @@
-import faiss
+import logging
 import numpy as np
+import faiss
+from typing import List, Dict, Optional
 from pymongo import MongoClient
 from pymongo.collection import Collection
-from typing import List, Dict, Optional
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from sentence_transformers import SentenceTransformer
+from contextlib import contextmanager
+
 from app.config import settings
+from app.database.mongodb import get_mongo_collection
+from app.exceptions import VectorStoreError
+
+logger = logging.getLogger(__name__)
 
 class VectorStoreService:
-    def __init__(self):
-        # Initialize embeddings model
-        self.embedding_model = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-mpnet-base-v2",
-            model_kwargs={'device': 'cpu'}
-        )
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialize()
+        return cls._instance
+
+    def _initialize(self):
+        """Initialize the vector store service (singleton pattern)"""
+        logger.info("Initializing VectorStoreService")
         
-        # Connect to MongoDB
-        self.client = MongoClient(settings.MONGO_URI)
-        self.db = self.client[settings.MONGO_DB_NAME]
-        self.collection: Collection = self.db[settings.MONGO_VECTOR_COLLECTION]
+        # Initialize embeddings model
+        self.embedding_model = SentenceTransformer(
+            settings.EMBEDDING_MODEL,
+            device='cpu'
+        )
+        self.embedding_size = self.embedding_model.get_sentence_embedding_dimension()
         
         # Initialize FAISS index
-        self.embedding_size = 768  # Size of embeddings from the model
         self.index = faiss.IndexFlatL2(self.embedding_size)
+        self.index_id_map = faiss.IndexIDMap(self.index)
+        
+        # MongoDB collection for metadata
+        self.collection_name = settings.MONGO_VECTOR_COLLECTION
 
-    def create_and_store_embeddings(self, document_id: str, text: str, metadata: Dict):
-        # Split text into chunks (simplified - consider better chunking strategies)
-        chunks = self._chunk_text(text)
-        
-        # Generate embeddings for each chunk
-        embeddings = self.embedding_model.embed_documents(chunks)
-        embeddings_array = np.array(embeddings).astype('float32')
-        
-        # Add vectors to FAISS index
-        if not self.index.is_trained:
-            self.index.add(embeddings_array)
-        
-        # Store chunks and embeddings in MongoDB
-        documents_to_insert = []
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-            documents_to_insert.append({
-                "document_id": document_id,
-                "chunk_id": f"{document_id}_{i}",
-                "chunk_text": chunk,
-                "embedding": embedding.tolist(),
-                "metadata": metadata,
-                "chunk_index": i
-            })
-        
-        self.collection.insert_many(documents_to_insert)
-        
-        return len(chunks)
+    async def create_and_store_embeddings(
+        self,
+        document_id: str,
+        text: str,
+        metadata: Dict
+    ) -> int:
+        """Process text and store embeddings with metadata"""
+        try:
+            # Chunk the text
+            chunks = self._chunk_text(text)
+            
+            # Generate embeddings
+            embeddings = self.embedding_model.encode(
+                chunks,
+                show_progress_bar=False,
+                convert_to_numpy=True
+            ).astype('float32')
+            
+            # Prepare documents for MongoDB
+            operations = []
+            chunk_ids = []
+            
+            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                chunk_id = f"{document_id}_{i}"
+                chunk_ids.append(chunk_id)
+                
+                operations.append({
+                    'chunk_id': chunk_id,
+                    'document_id': document_id,
+                    'chunk_text': chunk,
+                    'embedding': embedding.tolist(),
+                    'metadata': metadata,
+                    'chunk_index': i
+                })
+            
+            # Store in MongoDB and FAISS
+            with get_mongo_collection(self.collection_name) as collection:
+                # Add to FAISS index
+                ids = np.array([i for i in range(len(chunk_ids))])
+                self.index_id_map.add_with_ids(embeddings, ids)
+                
+                # Insert into MongoDB
+                result = collection.insert_many(operations)
+                logger.info(f"Stored {len(result.inserted_ids)} chunks for document {document_id}")
+                
+                return len(result.inserted_ids)
+                
+        except Exception as e:
+            logger.error(f"Error storing embeddings: {str(e)}")
+            raise VectorStoreError(f"Failed to store embeddings: {str(e)}")
 
-    def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
-        """Simple text chunking implementation"""
+    async def search_similar_chunks(
+        self,
+        document_id: str,
+        query: str,
+        k: int = 5
+    ) -> List[Dict]:
+        """Search for similar text chunks"""
+        try:
+            # Embed the query
+            query_embedding = self.embedding_model.encode(
+                query,
+                show_progress_bar=False
+            ).astype('float32').reshape(1, -1)
+            
+            # Search in FAISS
+            distances, indices = self.index_id_map.search(query_embedding, k)
+            
+            # Get chunks from MongoDB
+            with get_mongo_collection(self.collection_name) as collection:
+                chunks = list(collection.find({
+                    "document_id": document_id,
+                    "chunk_index": {"$in": [int(i) for i in indices[0]]}
+                }).sort("chunk_index", 1))
+                
+                # Add similarity scores
+                for chunk, distance in zip(chunks, distances[0]):
+                    chunk['similarity_score'] = 1 / (1 + distance)
+                
+                return chunks
+                
+        except Exception as e:
+            logger.error(f"Error searching chunks: {str(e)}")
+            raise VectorStoreError(f"Search failed: {str(e)}")
+
+    def _chunk_text(self, text: str) -> List[str]:
+        """Improved text chunking with overlap and paragraph awareness"""
+        # Implement your preferred chunking strategy here
+        # Example: Split by paragraphs first, then by sentences if needed
+        paragraphs = [p for p in text.split('\n') if p.strip()]
         chunks = []
-        start = 0
-        end = chunk_size
+        current_chunk = ""
         
-        while start < len(text):
-            chunks.append(text[start:end])
-            start = end - overlap
-            end = start + chunk_size
+        for para in paragraphs:
+            if len(current_chunk) + len(para) <= settings.CHUNK_SIZE:
+                current_chunk += para + "\n"
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = para + "\n"
         
-        return chunks
-
-    def search_similar_chunks(self, document_id: str, query: str, k: int = 10) -> List[Dict]:
-        # Embed the query
-        query_embedding = self.embedding_model.embed_query(query)
-        query_vector = np.array([query_embedding]).astype('float32')
-        
-        # Search in FAISS index
-        distances, indices = self.index.search(query_vector, k)
-        
-        # Get the actual chunks from MongoDB
-        chunk_ids = [f"{document_id}_{idx}" for idx in indices[0]]
-        chunks = list(self.collection.find({"chunk_id": {"$in": chunk_ids}}))
-        
-        # Sort chunks by their original order in the document
-        chunks.sort(key=lambda x: x["chunk_index"])
+        if current_chunk:
+            chunks.append(current_chunk.strip())
         
         return chunks
 
-    def close(self):
-        self.client.close()
+    async def delete_document_embeddings(self, document_id: str) -> bool:
+        """Delete all embeddings for a document"""
+        try:
+            with get_mongo_collection(self.collection_name) as collection:
+                # Find all chunks for this document
+                chunks = collection.find({"document_id": document_id})
+                chunk_indices = [chunk['chunk_index'] for chunk in chunks]
+                
+                # Remove from FAISS
+                if chunk_indices:
+                    ids_to_remove = np.array(chunk_indices)
+                    self.index_id_map.remove_ids(ids_to_remove)
+                
+                # Delete from MongoDB
+                result = collection.delete_many({"document_id": document_id})
+                return result.deleted_count > 0
+                
+        except Exception as e:
+            logger.error(f"Error deleting embeddings: {str(e)}")
+            raise VectorStoreError(f"Failed to delete embeddings: {str(e)}")

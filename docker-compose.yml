@@ -9,45 +9,54 @@ services:
       - .:/app
       - uploads:/app/uploads
     environment:
-      - MYSQL_HOST=db
-      - MYSQL_USER=root
-      - MYSQL_PASSWORD=rootpassword
-      - MYSQL_DB=document_ai
-      - MONGO_URI=mongodb://mongo:27017
-      - MONGO_DB_NAME=document_ai
-      - SECRET_KEY=tu_clave_secreta_aqui
-      - OLLAMA_BASE_URL=http://ollama:11434
+      - ENVIRONMENT=development
+      - DEBUG=true
     depends_on:
-      - db
-      - mongo
-      - ollama
+      db:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   db:
     image: mysql:8.0
     environment:
       MYSQL_ROOT_PASSWORD: rootpassword
       MYSQL_DATABASE: document_ai
+      MYSQL_USER: appuser
+      MYSQL_PASSWORD: apppass
     volumes:
       - mysql_data:/var/lib/mysql
-    ports:
-      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u$$MYSQL_USER", "-p$$MYSQL_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   mongo:
     image: mongo:6.0
     volumes:
       - mongo_data:/data/db
-    ports:
-      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  ollama:
-    image: ollama/ollama
-    volumes:
-      - ollama_data:/root/.ollama
-    ports:
-      - "11434:11434"
+  migrator:
+    build: .
+    command: sh -c "alembic upgrade head"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - ENVIRONMENT=development
 
 volumes:
   mysql_data:
   mongo_data:
-  ollama_data:
   uploads:

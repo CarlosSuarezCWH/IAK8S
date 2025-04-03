@@ -1,49 +1,156 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: app
+  name: {{ .Release.Name }}-app
+  namespace: {{ .Values.namespace | default "document-ai" }}
   labels:
-    app: document-ai
+    app.kubernetes.io/name: document-ai
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Values.image.tag | default "latest" }}
 spec:
-  replicas: 3
+  replicas: {{ .Values.replicaCount | default 3 }}
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
   selector:
     matchLabels:
-      app: document-ai
+      app.kubernetes.io/name: document-ai
+      app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
       labels:
-        app: document-ai
+        app.kubernetes.io/name: document-ai
+        app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
     spec:
+      serviceAccountName: {{ .Values.serviceAccount | default "document-ai" }}
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsNonRoot: true
       initContainers:
-        - name: init-db
-          image: busybox
-          command: ['sh', '-c', 'until nc -z db 3306; do echo "Waiting for MySQL"; sleep 2; done']
+        - name: wait-for-dependencies
+          image: bitnami/kubectl:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until kubectl exec -n {{ .Values.namespace }} {{ .Release.Name }}-db-0 -- \
+                mysqladmin ping -u${DB_USER} -p${DB_PASSWORD} --silent; do
+                echo "Waiting for MySQL to be ready...";
+                sleep 5;
+              done
+              
+              until kubectl exec -n {{ .Values.namespace }} {{ .Release.Name }}-mongo-0 -- \
+                mongosh --eval "db.adminCommand('ping')"; do
+                echo "Waiting for MongoDB to be ready...";
+                sleep 5;
+              done
+              
+              echo "All dependencies ready!"
+          env:
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-db-secrets
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-db-secrets
+                  key: password
+
       containers:
-      - name: app
-        image: your-registry/document-ai:${TAG}
-        ports:
-        - containerPort: 8000
-        envFrom:
-        - configMapRef:
-            name: app-config
-        - secretRef:
-            name: app-secrets
-        volumeMounts:
-        - name: uploads
-          mountPath: /app/uploads
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 10
-          periodSeconds: 5
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 30
-          periodSeconds: 10
+        - name: app
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag | default "latest" }}
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: {{ .Release.Name }}-app-config
+            - secretRef:
+                name: {{ .Release.Name }}-app-secrets
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+            requests:
+              cpu: 200m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/uploads
+            - name: config-volume
+              mountPath: /app/alembic.ini
+              subPath: alembic.ini
+              readOnly: true
+
       volumes:
-      - name: uploads
-        persistentVolumeClaim:
-          claimName: uploads-pvc
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-uploads-pvc
+        - name: config-volume
+          configMap:
+            name: {{ .Release.Name }}-alembic-config
+            items:
+              - key: alembic.ini
+                path: alembic.ini
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ .Release.Name }}-app-hpa
+  namespace: {{ .Values.namespace | default "document-ai" }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ .Release.Name }}-app
+  minReplicas: {{ .Values.autoscaling.minReplicas | default 2 }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas | default 10 }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage | default 70 }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage | default 80 }}
+    - type: External
+      external:
+        metric:
+          name: requests_per_second
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: document-ai
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.targetRPS | default "50" }}
